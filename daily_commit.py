@@ -6,19 +6,37 @@ With adjusted weights, averages ~3-4 commits per day for realistic activity.
 """
 
 import argparse
-import os
+import logging
 import random
 import subprocess
 from datetime import datetime
 from pathlib import Path
+from typing import List, Optional
+
+import config
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 
 class DailyCommitter:
-    def __init__(self, repo_path="."):
+    """Handles daily GitHub commit generation and management."""
+    
+    def __init__(self, repo_path: str = ".") -> None:
+        """
+        Initialize the DailyCommitter.
+        
+        Args:
+            repo_path: Path to the git repository root
+        """
         self.repo_path = Path(repo_path)
-        self.activity_file = self.repo_path / "activity.log"
+        self.activity_file = self.repo_path / config.ACTIVITY_LOG_FILE
 
-    def get_s_curve_commits(self):
+    def get_s_curve_commits(self) -> int:
         """
         Generate random number of commits (0-2) using weighted distribution.
 
@@ -28,16 +46,28 @@ class DailyCommitter:
         - 5% chance of 2 commits (rare bursts)
 
         Expected: ~3-4 commits per day (0.45 commits/run * 8 runs)
+        
+        Returns:
+            Number of commits to create (0 to MAX_COMMITS_PER_RUN)
         """
-        # Weights adjusted for 8 runs per day to avoid too many commits
-        weights = [60, 35, 5]  # 0, 1, 2 commits
-
-        # Use weighted random choice
-        commits = random.choices(range(3), weights=weights, k=1)[0]
+        max_commits = config.MAX_COMMITS_PER_RUN + 1  # range is exclusive
+        commits = random.choices(
+            range(max_commits),
+            weights=config.COMMIT_WEIGHTS,
+            k=1
+        )[0]
         return commits
 
-    def run_git_command(self, command):
-        """Execute a git command and return the result."""
+    def run_git_command(self, command: List[str]) -> Optional[str]:
+        """
+        Execute a git command and return the result.
+        
+        Args:
+            command: Git command as a list of strings (e.g., ["git", "add", "file"])
+            
+        Returns:
+            Command stdout if successful, None otherwise
+        """
         try:
             result = subprocess.run(
                 command,
@@ -48,82 +78,133 @@ class DailyCommitter:
             )
             return result.stdout.strip()
         except subprocess.CalledProcessError as e:
-            print(f"Git command failed: {e}")
-            print(f"Error output: {e.stderr}")
+            logger.error(f"Git command failed: {' '.join(command)}")
+            logger.error(f"Error output: {e.stderr}")
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error running git command: {e}")
             return None
 
-    def truncate_log_file(self, max_lines=100):
-        """Keep only the last max_lines in the activity log."""
+    def truncate_log_file(self, max_lines: int = config.MAX_LOG_LINES) -> None:
+        """
+        Keep only the last max_lines in the activity log.
+        
+        Args:
+            max_lines: Maximum number of lines to keep in the log file
+        """
         if not self.activity_file.exists():
             return
 
-        # Read all lines
-        with open(self.activity_file, "r") as f:
-            lines = f.readlines()
+        try:
+            # Read all lines
+            with open(self.activity_file, "r", encoding="utf-8") as f:
+                lines = f.readlines()
 
-        # If we have more than max_lines, keep only the last max_lines
-        if len(lines) > max_lines:
-            with open(self.activity_file, "w") as f:
-                f.writelines(lines[-max_lines:])
-            print(f"Truncated log file to {max_lines} lines")
+            # If we have more than max_lines, keep only the last max_lines
+            if len(lines) > max_lines:
+                with open(self.activity_file, "w", encoding="utf-8") as f:
+                    f.writelines(lines[-max_lines:])
+                logger.info(f"Truncated log file to {max_lines} lines")
+        except IOError as e:
+            logger.error(f"Error truncating log file: {e}")
 
-    def update_activity_file(self):
-        """Update the activity log file with a timestamp."""
+    def update_activity_file(self) -> str:
+        """
+        Update the activity log file with a timestamp.
+        
+        Returns:
+            Timestamp string that was logged
+        """
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # Create or append to activity file
-        with open(self.activity_file, "a") as f:
-            f.write(f"{timestamp} - Activity logged\n")
+        try:
+            # Create or append to activity file
+            with open(self.activity_file, "a", encoding="utf-8") as f:
+                f.write(f"{timestamp} - Activity logged\n")
 
-        # Truncate if needed
-        self.truncate_log_file(max_lines=100)
+            # Truncate if needed
+            self.truncate_log_file()
 
-        return timestamp
+            return timestamp
+        except IOError as e:
+            logger.error(f"Error updating activity file: {e}")
+            raise
 
-    def make_commit(self, commit_number):
-        """Create a single commit."""
-        timestamp = self.update_activity_file()
+    def make_commit(self, commit_number: int) -> bool:
+        """
+        Create a single commit.
+        
+        Args:
+            commit_number: Sequential number for this commit
+            
+        Returns:
+            True if commit was successful, False otherwise
+        """
+        try:
+            timestamp = self.update_activity_file()
+        except Exception as e:
+            logger.error(f"Failed to update activity file: {e}")
+            return False
 
         # Stage the changes
-        self.run_git_command(["git", "add", "activity.log"])
+        stage_result = self.run_git_command(["git", "add", config.ACTIVITY_LOG_FILE])
+        if stage_result is None:
+            logger.warning("Failed to stage activity.log file")
+            return False
 
         # Create commit
-        commit_message = f"Daily activity update #{commit_number} - {timestamp}"
-        result = self.run_git_command(["git", "commit", "-m", commit_message])
+        commit_message = config.COMMIT_MESSAGE_TEMPLATE.format(
+            commit_number=commit_number,
+            timestamp=timestamp
+        )
+        commit_result = self.run_git_command(["git", "commit", "-m", commit_message])
 
-        if result is not None:
-            print(f"Commit #{commit_number} created: {commit_message}")
+        if commit_result is not None:
+            logger.info(f"Commit #{commit_number} created: {commit_message}")
             return True
+        
+        logger.warning(f"Failed to create commit #{commit_number}")
         return False
 
-    def push_commits(self):
-        """Push all commits to GitHub."""
-        print("Pushing commits to GitHub...")
+    def push_commits(self) -> bool:
+        """
+        Push all commits to GitHub.
+        
+        Returns:
+            True if push was successful, False otherwise
+        """
+        logger.info("Pushing commits to GitHub...")
         result = self.run_git_command(["git", "push"])
 
         if result is not None:
-            print("Successfully pushed to GitHub!")
+            logger.info("Successfully pushed to GitHub!")
             return True
-        else:
-            print("Failed to push to GitHub")
-            return False
+        
+        logger.error("Failed to push to GitHub")
+        return False
 
-    def run(self, auto_push=True, test_mode=False):
-        """Main execution: create 0-2 random commits and optionally push."""
+    def run(self, auto_push: bool = True, test_mode: bool = False) -> None:
+        """
+        Main execution: create 0-2 random commits and optionally push.
+        
+        Args:
+            auto_push: Whether to automatically push commits after creation
+            test_mode: If True, always create MAX_COMMITS_PER_RUN commits
+        """
         # Random number of commits using S-curve distribution
         if test_mode:
-            num_commits = 2  # Always create 2 commits in test mode
-            print(f"=== Daily GitHub Activity (TEST MODE) ===")
+            num_commits = config.MAX_COMMITS_PER_RUN  # Always create max commits in test mode
+            logger.info("=== Daily GitHub Activity (TEST MODE) ===")
         else:
             num_commits = self.get_s_curve_commits()
-            print(f"=== Daily GitHub Activity ===")
+            logger.info("=== Daily GitHub Activity ===")
 
-        print(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-        print(f"Commits to create: {num_commits}")
-        print("=" * 30)
+        logger.info(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        logger.info(f"Commits to create: {num_commits}")
+        logger.info("=" * 30)
 
         if num_commits == 0:
-            print("No commits this run. Skipping...")
+            logger.info("No commits this run. Skipping...")
             return
 
         # Create the commits
@@ -133,7 +214,7 @@ class DailyCommitter:
             if self.make_commit(i):
                 successful_commits += 1
 
-        print(f"\nCreated {successful_commits} commit(s)")
+        logger.info(f"\nCreated {successful_commits} commit(s)")
 
         # Push to GitHub if enabled
         if successful_commits > 0 and auto_push:
@@ -142,7 +223,7 @@ class DailyCommitter:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Create 0-8 random commits for daily GitHub activity"
+        description=f"Create 0-{config.MAX_COMMITS_PER_RUN} random commits for daily GitHub activity"
     )
     parser.add_argument(
         "--no-push",
